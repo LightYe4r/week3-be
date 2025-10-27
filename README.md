@@ -12,7 +12,7 @@ PORT=3000
 NODE_ENV=production
 
 # Database Configuration
-DB_HOST=your-rds-endpoint.ap-northeast-2.rds.amazonaws.com
+DB_HOST=msj-rds.clia0kokmsb1.ap-northeast-2.rds.amazonaws.com
 DB_PORT=3306
 DB_NAME=myappdb
 DB_USER=admin
