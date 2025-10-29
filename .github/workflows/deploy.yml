@@ -1,6 +1,8 @@
 name: Deploy Backend (ECS Blue/Green)
 
-on: { push: { branches: [main] } }
+on:
+  push:
+    branches: [main]
 
 permissions:
   id-token: write
@@ -10,8 +12,9 @@ env:
   AWS_REGION: ap-northeast-2
   ECS_CLUSTER: msj-ecs-cluster
   ECS_SERVICE: msj-TD-BE-service-26hram3b
-  ECR_REPO: msj/be
+  TD_FAMILY: msj-TD-BE          # ← BE 태스크 정의 패밀리
   CONTAINER_NAME: msj-be
+  ECR_REPO: msj/be
 
 jobs:
   deploy:
@@ -27,36 +30,58 @@ jobs:
       - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push
+      - name: Build & Push image
+        id: build
         env:
           REG: ${{ steps.login-ecr.outputs.registry }}
           TAG: ${{ github.sha }}
         run: |
-          docker build -t $REG/$ECR_REPO:$TAG .
-          docker push $REG/$ECR_REPO:$TAG
-          echo "IMAGE=$REG/$ECR_REPO:$TAG" >> $GITHUB_ENV
+          docker build -t $REG/${{ env.ECR_REPO }}:$TAG .
+          docker push $REG/${{ env.ECR_REPO }}:$TAG
+          echo "IMAGE=$REG/${{ env.ECR_REPO }}:$TAG" >> $GITHUB_ENV
 
-      - name: Render task def
+      # (선택) jq 보장
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch current task definition as base
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.TD_FAMILY }}" \
+            --query taskDefinition > taskdef-raw.json
+          # 불필요 필드 제거
+          cat taskdef-raw.json | jq 'del(
+            .taskDefinitionArn,.requiresAttributes,.compatibilities,
+            .revision,.status,.registeredAt,.registeredBy
+          )' > taskdef.json
+
+      - name: Render task definition with new image
         id: render
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: task-def.json   # 저장해둔 베이스 TD 파일
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ env.IMAGE }}
+          task-definition: taskdef.json            # ← FE와 동일한 파일명
+          container-name: ${{ env.CONTAINER_NAME }}# msj-be
+          image: ${{ env.IMAGE }}                  # 위 Build 스텝에서 넣은 IMAGE
 
-      - name: Register task def
-        id: reg
+      - name: Register task definition
+        id: register
         run: |
-          ARN=$(aws ecs register-task-definition \
+          TD_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://${{ steps.render.outputs.task-definition }} \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "TD=$ARN" >> $GITHUB_ENV
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "TD_ARN=$TD_ARN" >> $GITHUB_ENV
+          echo "✅ Registered: $TD_ARN"
 
-      - name: Update service (triggers blue/green)
+      - name: Update service (triggers ECS Blue/Green)
         run: |
           aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --task-definition "$TD" \
+            --cluster  "${{ env.ECS_CLUSTER }}" \
+            --service  "${{ env.ECS_SERVICE }}" \
+            --task-definition "$TD_ARN" \
             --force-new-deployment
-          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "⏳ Waiting for service to stabilize (ECS will switch traffic)..."
+          aws ecs wait services-stable \
+            --cluster  "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}"
+          echo "🎉 BE Blue/Green deployment complete!"
