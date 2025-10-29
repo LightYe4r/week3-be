@@ -1,4 +1,4 @@
-name: Deploy Backend to ECS
+name: Deploy Backend (Blue/Green)
 
 on:
   push:
@@ -7,6 +7,18 @@ on:
 permissions:
   id-token: write
   contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECS_CLUSTER: msj-ecs-cluster
+  # Blue/Green 서비스명 (콘솔에서 생성되어 있어야 함)
+  BE_SERVICE_BLUE:  msj-TD-BE-service-26hram3b
+  BE_SERVICE_GREEN: msj-TD-BE-service-green
+  CONTAINER_NAME: msj-be   # ← TD의 실제 컨테이너명으로 맞춰주세요
+  ECR_REPOSITORY: msj/be
+  TG_BLUE:  msj-tg-be
+  TG_GREEN: msj-tg-be-g
+  ALB_NAME: msj-alb
 
 jobs:
   deploy:
@@ -20,27 +32,205 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::286387522454:role/msj-role-github
-          aws-region: ap-northeast-2
+          aws-region: ${{ env.AWS_REGION }}
       
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
       
       - name: Build and push Docker image
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: msj/be
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          set -e
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker tag  $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
       
-      - name: Force ECS deployment
+      - name: Get ALB Listener and BE /api/* rule ARN
+        id: get-alb-info
         run: |
+          set -e
+          LB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text)
+          echo "lb_arn=$LB_ARN" >> $GITHUB_OUTPUT
+          
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$LB_ARN" \
+            --query 'Listeners[?Port==`443`].ListenerArn' \
+            --output text)
+          echo "listener_arn=$LISTENER_ARN" >> $GITHUB_OUTPUT
+          
+          # 기본 규칙이 아닌, path-pattern == "/api/*" 규칙 ARN을 집는다
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn "$LISTENER_ARN" \
+            --query "Rules[?IsDefault==\`false\` && Conditions[?Field=='path-pattern' && contains(Values, '/api/*')]].RuleArn | [0]" \
+            --output text)
+          if [ -z "$RULE_ARN" ] || [ "$RULE_ARN" = "None" ]; then
+            echo "::error ::BE /api/* rule not found on listener $LISTENER_ARN"; exit 1
+          fi
+          echo "rule_arn=$RULE_ARN" >> $GITHUB_OUTPUT
+      
+      - name: Get Target Group ARNs
+        id: get-tg-arns
+        run: |
+          set -e
+          BLUE_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_BLUE" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          echo "blue_tg_arn=$BLUE_TG_ARN" >> $GITHUB_OUTPUT
+          
+          GREEN_TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_GREEN" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          echo "green_tg_arn=$GREEN_TG_ARN" >> $GITHUB_OUTPUT
+      
+      - name: Determine current environment (Blue or Green live)
+        id: determine-env
+        run: |
+          set -e
+          TG_JSON=$(aws elbv2 describe-rules \
+            --rule-arns "${{ steps.get-alb-info.outputs.rule_arn }}" \
+            --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups' \
+            --output json)
+
+          if [[ "$TG_JSON" == "null" || -z "$TG_JSON" ]]; then
+            echo "current=blue"  >> $GITHUB_OUTPUT
+            echo "target=green"  >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BLUE_ARN=${{ steps.get-tg-arns.outputs.blue_tg_arn }}
+          GREEN_ARN=${{ steps.get-tg-arns.outputs.green_tg_arn }}
+
+          BLUE_WEIGHT=$(echo "$TG_JSON"  | jq -r --arg B "$BLUE_ARN"  '.[] | select(.TargetGroupArn==$B) | .Weight')
+          if [[ "$BLUE_WEIGHT" == "100" || -z "$BLUE_WEIGHT" ]]; then
+            echo "current=blue"  >> $GITHUB_OUTPUT
+            echo "target=green"  >> $GITHUB_OUTPUT
+            echo "📘 Current: Blue (100%) → Deploying to: 🟢 Green"
+          else
+            echo "current=green" >> $GITHUB_OUTPUT
+            echo "target=blue"   >> $GITHUB_OUTPUT
+            echo "🟢 Current: Green (100%) → Deploying to: 📘 Blue"
+          fi
+      
+      - name: Download task definition
+        run: |
+          set -e
+          aws ecs describe-task-definition \
+            --task-definition msj-TD-BE \
+            --query taskDefinition > task-def-raw.json
+          cat task-def-raw.json | jq 'del(
+            .taskDefinitionArn,
+            .requiresAttributes,
+            .compatibilities,
+            .revision,
+            .status,
+            .registeredAt,
+            .registeredBy
+          )' > task-definition.json
+      
+      - name: Update task definition with new image
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+      
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          set -e
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.update-task-def.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "✅ New task definition: $TASK_DEF_ARN"
+      
+      - name: Choose target service (deploy here)
+        id: choose-svc
+        run: |
+          if [[ "${{ steps.determine-env.outputs.target }}" == "green" ]]; then
+            echo "svc=${{ env.BE_SERVICE_GREEN }}" >> $GITHUB_OUTPUT
+            echo "prev=${{ env.BE_SERVICE_BLUE }}"  >> $GITHUB_OUTPUT
+          else
+            echo "svc=${{ env.BE_SERVICE_BLUE }}"  >> $GITHUB_OUTPUT
+            echo "prev=${{ env.BE_SERVICE_GREEN }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Deploy to target service
+        run: |
+          set -e
           aws ecs update-service \
-            --cluster msj-ecs-cluster \
-            --service msj-TD-BE-service-26hram3b \
-            --force-new-deployment \
-            --region ap-northeast-2
+            --cluster $ECS_CLUSTER \
+            --service  ${{ steps.choose-svc.outputs.svc }} \
+            --task-definition ${{ steps.register-task-def.outputs.arn }} \
+            --desired-count 1 \
+            --force-new-deployment
+          echo "🚀 Deployment initiated to ${{ steps.choose-svc.outputs.svc }}"
+      
+      - name: Wait for new tasks to be healthy
+        run: |
+          set -e
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services ${{ steps.choose-svc.outputs.svc }}
+
+          TARGET_TG_ARN=${{ steps.get-tg-arns.outputs.green_tg_arn }}
+          if [[ "${{ steps.determine-env.outputs.target }}" == "blue" ]]; then
+            TARGET_TG_ARN=${{ steps.get-tg-arns.outputs.blue_tg_arn }}
+          fi
+
+          echo "⏳ Checking target health..."
+          for i in {1..30}; do
+            ok=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_TG_ARN" \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' \
+              --output text)
+            [[ "$ok" -gt 0 ]] && echo "✅ Targets are healthy!" && break
+            [[ $i -eq 30 ]] && echo "❌ Timeout waiting for healthy targets" && exit 1
+            sleep 10
+          done
+      
+      - name: Switch traffic to new environment (/api/* rule)
+        run: |
+          set -e
+          echo "🔀 Switching traffic to ${{ steps.determine-env.outputs.target }}..."
+          if [[ "${{ steps.determine-env.outputs.target }}" == "green" ]]; then
+            aws elbv2 modify-rule \
+              --rule-arn "${{ steps.get-alb-info.outputs.rule_arn }}" \
+              --actions Type=forward,ForwardConfig="{TargetGroups=[{TargetGroupArn=${{ steps.get-tg-arns.outputs.blue_tg_arn }},Weight=0},{TargetGroupArn=${{ steps.get-tg-arns.outputs.green_tg_arn }},Weight=100}]}"
+            echo "✅ 🟢 Green: 100%, 📘 Blue: 0%"
+          else
+            aws elbv2 modify-rule \
+              --rule-arn "${{ steps.get-alb-info.outputs.rule_arn }}" \
+              --actions Type=forward,ForwardConfig="{TargetGroups=[{TargetGroupArn=${{ steps.get-tg-arns.outputs.blue_tg_arn }},Weight=100},{TargetGroupArn=${{ steps.get-tg-arns.outputs.green_tg_arn }},Weight=0}]}"
+            echo "✅ 📘 Blue: 100%, 🟢 Green: 0%"
+          fi
+      
+      - name: Scale down previous service
+        run: |
+          set -e
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service  ${{ steps.choose-svc.outputs.prev }} \
+            --desired-count 0
+      
+      - name: Deployment summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 Deployment completed!"
+          echo "Target env: ${{ steps.determine-env.outputs.target }}"
+          echo "Deployed service: ${{ steps.choose-svc.outputs.svc }}"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
