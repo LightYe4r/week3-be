@@ -60,7 +60,7 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: taskdef.json            # ← FE와 동일한 파일명
-          container-name: ${{ env.CONTAINER_NAME }}# msj-be
+          container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ env.IMAGE }}                  # 위 Build 스텝에서 넣은 IMAGE
 
       - name: Register task definition
