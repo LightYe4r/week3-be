@@ -12,17 +12,17 @@ PORT=3000
 NODE_ENV=production
 
 # Database Configuration
-DB_HOST=msj-rds.clia0kokmsb1.ap-northeast-2.rds.amazonaws.com
+DB_HOST=your-rds-endpoint.rds.amazonaws.com
 DB_PORT=3306
 DB_NAME=myappdb
 DB_USER=admin
-DB_PASSWORD=smileshark
+DB_PASSWORD=your-password
 
 # JWT Secret (반드시 변경!)
-JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+JWT_SECRET=your-jwt-secret
 
 # CORS (프론트엔드 URL)
-CORS_ORIGIN=http://your-frontend-alb-url
+CORS_ORIGIN=http://your-domain.com
 ```
 
 ## 로컬 실행
@@ -54,7 +54,7 @@ docker run -d -p 3000:3000 \
   -e DB_PASSWORD=smileshark \
   -e DB_NAME=myappdb \
   -e JWT_SECRET=your-secret \
-  -e CORS_ORIGIN=http://your-frontend-url \
+  -e CORS_ORIGIN=http://your-domain.com \
   myapp-backend
 ```
 
@@ -63,7 +63,7 @@ docker run -d -p 3000:3000 \
 ### Public
 - `POST /api/signup` - 회원가입
 - `POST /api/login` - 로그인
-- `GET /health` - 헬스체크
+- `GET /api/health` - 헬스체크
 
 ### Protected (JWT 필요)
 - `GET /api/logs/me` - 내 로그인 기록
@@ -123,7 +123,7 @@ docker run -d -p 3000:3000 \
       },
       {
         "name": "CORS_ORIGIN",
-        "value": "http://your-frontend-alb-url"
+        "value": "http://your-domain.com"
       }
     ]
   }]
